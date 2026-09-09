@@ -63,6 +63,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from learned_watermark import BITS, Decoder, Encoder, distort, pick_device
 
 VALIDATION = 512
+VALIDATION_CHUNK = 64
 WARMUP_FRACTION = 0.4
 VAE_REPOSITORY = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 
@@ -210,20 +211,46 @@ def main(argv: list[str] | None = None) -> int:
             decoder.eval()
             with torch.no_grad():
                 probe = torch.randint(0, 2, (VALIDATION, BITS), device=device).float()
-                candidate = (
-                    held_out + encoder(held_out, probe) * args.res_scale
-                ).clamp(-1, 1)
+                # Validation runs in chunks for the same reason the VAE round trip
+                # below does: one 512-image forward pass at 128 pixels asks a 16 GB
+                # card for two gigabytes in a single activation and loses the run to
+                # an out-of-memory error. Both networks are in eval mode, so their
+                # batch norms read running statistics and the chunked result is the
+                # same numbers the whole-batch pass would have produced.
+                candidate = torch.cat(
+                    [
+                        (
+                            held_out[start : start + VALIDATION_CHUNK]
+                            + encoder(
+                                held_out[start : start + VALIDATION_CHUNK],
+                                probe[start : start + VALIDATION_CHUNK],
+                            )
+                            * args.res_scale
+                        ).clamp(-1, 1)
+                        for start in range(0, VALIDATION, VALIDATION_CHUNK)
+                    ]
+                )
                 accuracies = []
                 for level in (0.0, 0.5, 1.0):
-                    read = (decoder(distort(candidate, level)) > 0).float()
-                    accuracies.append((read == probe).float().mean().item())
+                    hits = []
+                    for start in range(0, VALIDATION, VALIDATION_CHUNK):
+                        piece = candidate[start : start + VALIDATION_CHUNK]
+                        read = (decoder(distort(piece, level)) > 0).float()
+                        hits.append(
+                            (read == probe[start : start + VALIDATION_CHUNK]).float().mean().item()
+                        )
+                    accuracies.append(float(np.mean(hits)))
                 vae_note = ""
                 if vae is not None:
                     hits = []
-                    for start in range(0, VALIDATION, 64):
-                        piece = vae_roundtrip(vae, candidate[start : start + 64])
+                    for start in range(0, VALIDATION, VALIDATION_CHUNK):
+                        piece = vae_roundtrip(
+                            vae, candidate[start : start + VALIDATION_CHUNK]
+                        )
                         read = (decoder(piece) > 0).float()
-                        hits.append((read == probe[start : start + 64]).float().mean().item())
+                        hits.append(
+                            (read == probe[start : start + VALIDATION_CHUNK]).float().mean().item()
+                        )
                     vae_note = f" vae {float(np.mean(hits)):.3f}"
             print(
                 f"step {step:5d} loss {loss.item():.4f} msg {message_loss.item():.4f} "
